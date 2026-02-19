@@ -1,6 +1,6 @@
 ---
 - name: Demo Playbook for Ubuntu VM
-  hosts: ubuntu
+  hosts: ubuntu_vm
   become: true
   vars:
     app_user: demouser
