@@ -53,10 +53,10 @@
           </html>
 
     - name: Open HTTP port in UFW
-      community.general.ufw:
-        rule: allow
-        port: "{{ nginx_port }}"
-        proto: tcp
+      ansible.builtin.command:
+        cmd: ufw allow {{ nginx_port }}/tcp
+      register: ufw_result
+      changed_when: "'Rules updated' in ufw_result.stdout"
 
     - name: Print VM info
       ansible.builtin.debug:
