@@ -1,0 +1,66 @@
+---
+- name: Demo Playbook for Ubuntu VM
+  hosts: ubuntu_vm
+  become: true
+  vars:
+    app_user: demouser
+    app_packages:
+      - git
+      - curl
+      - vim
+      - htop
+      - nginx
+    nginx_port: 80
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      ansible.builtin.apt:
+        name: "{{ app_packages }}"
+        state: present
+
+    - name: Create application user
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        shell: /bin/bash
+        create_home: true
+        state: present
+
+    - name: Ensure nginx is started and enabled
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: Deploy a simple index.html
+      ansible.builtin.copy:
+        dest: /var/www/html/index.html
+        owner: www-data
+        group: www-data
+        mode: "0644"
+        content: |
+          <!DOCTYPE html>
+          <html>
+            <head><title>Ansible Demo</title></head>
+            <body>
+              <h1>Hello from Ansible!</h1>
+              <p>Deployed on {{ ansible_hostname }} running {{ ansible_distribution }} {{ ansible_distribution_version }}</p>
+            </body>
+          </html>
+
+    - name: Open HTTP port in UFW
+      community.general.ufw:
+        rule: allow
+        port: "{{ nginx_port }}"
+        proto: tcp
+
+    - name: Print VM info
+      ansible.builtin.debug:
+        msg: >
+          Host: {{ ansible_hostname }}
+          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          IP: {{ ansible_default_ipv4.address }}
