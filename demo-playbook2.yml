@@ -1,0 +1,9 @@
+---
+- name: Hello World Demo
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Print Hello World
+      ansible.builtin.debug:
+        msg: "Hello World from {{ ansible_hostname }}!"
