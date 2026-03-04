@@ -58,14 +58,33 @@
     #  PHASE 3 — CHOCOLATEY (the "apt-get" of Windows)
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     - name: "3 · Install Chocolatey package manager"
-      chocolatey.chocolatey.win_chocolatey:
-        name: chocolatey
-        state: present
+      ansible.windows.win_powershell:
+        script: |
+          if (Get-Command choco -ErrorAction SilentlyContinue) {
+              $Ansible.Changed = $false
+              "Chocolatey already installed"
+          } else {
+              Set-ExecutionPolicy Bypass -Scope Process -Force
+              [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+              Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+              $Ansible.Changed = $true
+              "Chocolatey installed"
+          }
 
     - name: "3 · Install packages via Chocolatey"
-      chocolatey.chocolatey.win_chocolatey:
-        name: "{{ choco_packages }}"
-        state: present
+      ansible.windows.win_powershell:
+        script: |
+          $packages = @({{ choco_packages | map('regex_replace', '^(.*)$', "'\\1'") | join(', ') }})
+          $installed = choco list --local-only --limit-output | ForEach-Object { ($_ -split '\|')[0] }
+          $toInstall = $packages | Where-Object { $_ -notin $installed }
+          if ($toInstall.Count -eq 0) {
+              $Ansible.Changed = $false
+              "All packages already installed"
+          } else {
+              foreach ($pkg in $toInstall) { choco install $pkg -y --no-progress }
+              $Ansible.Changed = $true
+              "Installed: $($toInstall -join ', ')"
+          }
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     #  PHASE 4 — SELF-SIGNED SSL CERT + HTTPS ON IIS
