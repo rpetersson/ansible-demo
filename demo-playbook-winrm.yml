@@ -1,7 +1,6 @@
 ---
 - name: Hello World Demo
   hosts: all
-  become: true
 
   tasks:
     - name: Print Hello World
