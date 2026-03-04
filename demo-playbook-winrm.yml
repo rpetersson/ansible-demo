@@ -1,8 +1,363 @@
 ---
-- name: Hello World Demo
-  hosts: all
+- name: Demo Playbook for Windows Server (WinRM)
+  hosts: windows
+  gather_facts: true
+  vars:
+    app_user: demouser
+    app_password: D3m0P@ss2026!
+    iis_port: 80
+    https_port: 443
+    cert_dns_name: "{{ ansible_hostname }}.local"
+    windows_features:
+      - Web-Server
+      - Web-Asp-Net45
+      - Web-Mgmt-Console
+    choco_packages:
+      - notepadplusplus
+      - 7zip
+      - git
+      - sysinternals
+    disable_services:
+      - Spooler            # Print Spooler — not needed on most servers
+      - XblAuthManager     # Xbox Live Auth
+      - XblGameSave        # Xbox Live Game Save
 
   tasks:
-    - name: Print Hello World
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  PHASE 1 — SYSTEM INFO
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    - name: "1 · Print Windows system info"
       ansible.builtin.debug:
-        msg: "Hello World from {{ ansible_hostname }}!"
+        msg: >
+          Host: {{ ansible_hostname }}
+          OS: {{ ansible_os_name | default(ansible_distribution) }} {{ ansible_os_product_type }}
+          IP: {{ ansible_ip_addresses | first }}
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  PHASE 2 — INSTALL IIS + FEATURES
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    - name: "2 · Install IIS and management tools"
+      ansible.windows.win_feature:
+        name: "{{ windows_features }}"
+        state: present
+        include_management_tools: true
+      register: iis_install
+
+    - name: "2 · Reboot if feature install requires it"
+      ansible.windows.win_reboot:
+        reboot_timeout: 300
+      when: iis_install.reboot_required
+
+    - name: "2 · Ensure IIS (W3SVC) is started and set to auto"
+      ansible.windows.win_service:
+        name: W3SVC
+        start_mode: auto
+        state: started
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  PHASE 3 — CHOCOLATEY (the "apt-get" of Windows)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    - name: "3 · Install Chocolatey package manager"
+      chocolatey.chocolatey.win_chocolatey:
+        name: chocolatey
+        state: present
+
+    - name: "3 · Install packages via Chocolatey"
+      chocolatey.chocolatey.win_chocolatey:
+        name: "{{ choco_packages }}"
+        state: present
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  PHASE 4 — SELF-SIGNED SSL CERT + HTTPS ON IIS
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    - name: "4 · Generate a self-signed SSL certificate"
+      ansible.windows.win_powershell:
+        script: |
+          $existing = Get-ChildItem Cert:\LocalMachine\My |
+                      Where-Object { $_.Subject -eq "CN={{ cert_dns_name }}" }
+          if ($existing) {
+              $Ansible.Changed = $false
+              $existing.Thumbprint
+          } else {
+              $cert = New-SelfSignedCertificate `
+                  -DnsName "{{ cert_dns_name }}" `
+                  -CertStoreLocation Cert:\LocalMachine\My `
+                  -NotAfter (Get-Date).AddYears(2)
+              $Ansible.Changed = $true
+              $cert.Thumbprint
+          }
+      register: cert_result
+
+    - name: "4 · Bind SSL cert to IIS Default Web Site on port 443"
+      ansible.windows.win_powershell:
+        script: |
+          Import-Module WebAdministration
+          $thumb = "{{ cert_result.output | first | trim }}"
+          $binding = Get-WebBinding -Name "Default Web Site" -Protocol https -Port {{ https_port }} -ErrorAction SilentlyContinue
+          if (-not $binding) {
+              New-WebBinding -Name "Default Web Site" -Protocol https -Port {{ https_port }} -IPAddress "*"
+              $binding = Get-WebBinding -Name "Default Web Site" -Protocol https -Port {{ https_port }}
+              $binding.AddSslCertificate($thumb, "My")
+              $Ansible.Changed = $true
+          } else {
+              $Ansible.Changed = $false
+          }
+
+    - name: "4 · Open HTTPS port in Windows Firewall"
+      community.windows.win_firewall_rule:
+        name: Allow HTTPS (Ansible Demo)
+        localport: "{{ https_port }}"
+        protocol: tcp
+        direction: in
+        action: allow
+        state: present
+        enabled: true
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  PHASE 5 — DEPLOY WEB CONTENT
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    - name: "5 · Deploy demo index.html to IIS"
+      ansible.windows.win_copy:
+        dest: C:\inetpub\wwwroot\index.html
+        content: |
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <title>Ansible WinRM Demo</title>
+            <style>
+              * { margin: 0; padding: 0; box-sizing: border-box; }
+              body { font-family: 'Segoe UI', sans-serif; background: #0f0f23; color: #e0e0e0; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+              .card { background: linear-gradient(135deg, #1a1a3e, #16213e); border: 1px solid #0ff3; border-radius: 16px; padding: 3rem 4rem; max-width: 600px; text-align: center; box-shadow: 0 0 40px rgba(0,255,255,0.08); }
+              h1 { font-size: 2rem; color: #0ff; margin-bottom: 0.5rem; }
+              .subtitle { color: #888; font-size: 0.95rem; margin-bottom: 2rem; }
+              .info { text-align: left; margin-top: 1.5rem; }
+              .info div { padding: 0.5rem 0; border-bottom: 1px solid #ffffff10; font-size: 0.95rem; }
+              .info span { color: #0ff; font-weight: 600; }
+              .badge { display: inline-block; margin-top: 2rem; padding: 0.4rem 1.2rem; border-radius: 20px; background: #0ff2; border: 1px solid #0ff5; color: #0ff; font-size: 0.8rem; letter-spacing: 1px; text-transform: uppercase; }
+            </style>
+          </head>
+          <body>
+            <div class="card">
+              <h1>&#9889; Ansible over WinRM</h1>
+              <p class="subtitle">Zero-click server provisioning</p>
+              <div class="info">
+                <div><span>Hostname:</span> {{ ansible_hostname }}</div>
+                <div><span>OS:</span> Windows Server</div>
+                <div><span>IIS:</span> HTTP :{{ iis_port }} &amp; HTTPS :{{ https_port }}</div>
+                <div><span>Packages:</span> Chocolatey &middot; Notepad++ &middot; 7-Zip &middot; Git &middot; Sysinternals</div>
+                <div><span>Deployed:</span> {{ ansible_date_time.iso8601 }}</div>
+              </div>
+              <div class="badge">managed by ansible</div>
+            </div>
+          </body>
+          </html>
+
+    - name: "5 · Open HTTP port in Windows Firewall"
+      community.windows.win_firewall_rule:
+        name: Allow HTTP (Ansible Demo)
+        localport: "{{ iis_port }}"
+        protocol: tcp
+        direction: in
+        action: allow
+        state: present
+        enabled: true
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  PHASE 6 — LIVE SERVER DASHBOARD (PowerShell → HTML)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    - name: "6 · Generate a live HTML server dashboard"
+      ansible.windows.win_powershell:
+        script: |
+          $os    = Get-CimInstance Win32_OperatingSystem
+          $cpu   = Get-CimInstance Win32_Processor | Select-Object -First 1
+          $disk  = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+          $mem   = [math]::Round($os.TotalVisibleMemorySize/1MB,1)
+          $memFree = [math]::Round($os.FreePhysicalMemory/1MB,1)
+          $diskFree = [math]::Round($disk.FreeSpace/1GB,1)
+          $diskTotal = [math]::Round($disk.Size/1GB,1)
+          $uptime = (Get-Date) - $os.LastBootUpTime
+          $hotfixes = (Get-HotFix | Measure-Object).Count
+          $services = (Get-Service | Where-Object Status -eq Running | Measure-Object).Count
+          $procs = (Get-Process | Measure-Object).Count
+
+          $html = @"
+          <!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+          <title>Server Dashboard — $env:COMPUTERNAME</title>
+          <meta http-equiv="refresh" content="30">
+          <style>
+            * { margin:0; padding:0; box-sizing:border-box; }
+            body { font-family:'Segoe UI',sans-serif; background:#0a0a1a; color:#ccc; padding:2rem; }
+            h1 { color:#0ff; margin-bottom:.3rem; } .sub { color:#666; margin-bottom:2rem; }
+            .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:1rem; }
+            .tile { background:#12122a; border:1px solid #ffffff10; border-radius:12px; padding:1.5rem; }
+            .tile h3 { color:#0ff; font-size:.75rem; text-transform:uppercase; letter-spacing:1px; margin-bottom:.5rem; }
+            .tile .val { font-size:1.8rem; font-weight:700; color:#fff; }
+            .tile .detail { font-size:.8rem; color:#888; margin-top:.3rem; }
+            .bar { height:8px; border-radius:4px; background:#ffffff10; margin-top:.8rem; overflow:hidden; }
+            .bar .fill { height:100%; border-radius:4px; background:linear-gradient(90deg,#0ff,#06f); }
+            footer { margin-top:2rem; color:#444; font-size:.75rem; }
+          </style></head><body>
+          <h1>&#128421; $env:COMPUTERNAME</h1>
+          <p class="sub">$($os.Caption) — Auto-refreshes every 30 s</p>
+          <div class="grid">
+            <div class="tile"><h3>CPU</h3><div class="val">$($cpu.Name -replace '\(R\)|\(TM\)','')</div><div class="detail">$($cpu.NumberOfLogicalProcessors) logical cores</div></div>
+            <div class="tile"><h3>Memory</h3><div class="val">${memFree} / ${mem} GB free</div>
+              <div class="bar"><div class="fill" style="width:$(100 - [math]::Round($memFree/$mem*100))%"></div></div></div>
+            <div class="tile"><h3>Disk C:\</h3><div class="val">${diskFree} / ${diskTotal} GB free</div>
+              <div class="bar"><div class="fill" style="width:$(100 - [math]::Round($diskFree/$diskTotal*100))%"></div></div></div>
+            <div class="tile"><h3>Uptime</h3><div class="val">$($uptime.Days)d $($uptime.Hours)h $($uptime.Minutes)m</div></div>
+            <div class="tile"><h3>Running Services</h3><div class="val">$services</div></div>
+            <div class="tile"><h3>Processes</h3><div class="val">$procs</div></div>
+            <div class="tile"><h3>Installed Hotfixes</h3><div class="val">$hotfixes</div></div>
+            <div class="tile"><h3>Last Boot</h3><div class="val">$($os.LastBootUpTime.ToString('yyyy-MM-dd HH:mm'))</div></div>
+          </div>
+          <footer>Generated by Ansible at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') — Managed with zero manual clicks.</footer>
+          </body></html>
+          "@
+
+          $html | Out-File -FilePath C:\inetpub\wwwroot\dashboard.html -Encoding utf8 -Force
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  PHASE 7 — LOCAL USER + REGISTRY
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    - name: "7 · Create local demo user"
+      ansible.windows.win_user:
+        name: "{{ app_user }}"
+        password: "{{ app_password }}"
+        state: present
+        groups:
+          - Users
+          - Remote Desktop Users
+        password_never_expires: true
+
+    - name: "7 · Set custom registry value (demo branding)"
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\AnsibleDemo
+        name: ManagedBy
+        data: Ansible Automation
+        type: string
+        state: present
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  PHASE 8 — SCHEDULED TASK (recurring health check)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    - name: "8 · Ensure health-check script directory exists"
+      ansible.windows.win_file:
+        path: C:\AnsibleDemo\Scripts
+        state: directory
+
+    - name: "8 · Deploy health-check PowerShell script"
+      ansible.windows.win_copy:
+        dest: C:\AnsibleDemo\Scripts\HealthCheck.ps1
+        content: |
+          # Health-check script — deployed by Ansible
+          $report = @{
+              Timestamp    = Get-Date -Format 'o'
+              Hostname     = $env:COMPUTERNAME
+              UptimeDays   = ((Get-Date) - (Get-CimInstance Win32_OperatingSystem).LastBootUpTime).Days
+              DiskFreeGB   = [math]::Round((Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'").FreeSpace / 1GB, 2)
+              MemFreeGB    = [math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB, 2)
+              RunningProcs = (Get-Process).Count
+              IISRunning   = (Get-Service W3SVC).Status -eq 'Running'
+          }
+          $report | ConvertTo-Json | Out-File "C:\AnsibleDemo\Scripts\health-$(Get-Date -Format 'yyyyMMdd-HHmm').json" -Encoding utf8
+
+    - name: "8 · Create scheduled task — hourly health check"
+      community.windows.win_scheduled_task:
+        name: Ansible Health Check
+        description: Hourly server health check deployed by Ansible
+        actions:
+          - path: powershell.exe
+            arguments: -ExecutionPolicy Bypass -File C:\AnsibleDemo\Scripts\HealthCheck.ps1
+        triggers:
+          - type: daily
+            repetition:
+              interval: PT1H
+        username: SYSTEM
+        state: present
+        enabled: true
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  PHASE 9 — WINDOWS UPDATE SCAN
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    - name: "9 · Scan for pending Windows Updates (report only)"
+      ansible.windows.win_powershell:
+        script: |
+          $session = New-Object -ComObject Microsoft.Update.Session
+          $searcher = $session.CreateUpdateSearcher()
+          $results = $searcher.Search("IsInstalled=0")
+          $updates = $results.Updates | ForEach-Object {
+              [PSCustomObject]@{ Title = $_.Title; KB = ($_.KBArticleIDs -join ','); Severity = $_.MsrcSeverity }
+          }
+          if ($updates.Count -eq 0) { "No pending updates — server is fully patched." }
+          else { $updates | Format-Table -AutoSize | Out-String }
+      register: update_scan
+
+    - name: "9 · Show pending updates"
+      ansible.builtin.debug:
+        msg: "{{ update_scan.output }}"
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  PHASE 10 — HARDEN: DISABLE UNNECESSARY SERVICES
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    - name: "10 · Disable unnecessary services"
+      ansible.windows.win_service:
+        name: "{{ item }}"
+        start_mode: disabled
+        state: stopped
+      loop: "{{ disable_services }}"
+      ignore_errors: true   # some services may not exist on all editions
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  PHASE 11 — PROJECT FOLDER + README
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    - name: "11 · Drop a README into the project folder"
+      ansible.windows.win_copy:
+        dest: C:\AnsibleDemo\README.txt
+        content: |
+          ═══════════════════════════════════════════
+           This server is managed by Ansible
+          ═══════════════════════════════════════════
+           Playbook last ran : {{ ansible_date_time.iso8601 }}
+           Hostname          : {{ ansible_hostname }}
+           Chocolatey pkgs   : {{ choco_packages | join(', ') }}
+           HTTPS cert DNS    : {{ cert_dns_name }}
+           Health checks     : C:\AnsibleDemo\Scripts\
+          ═══════════════════════════════════════════
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  PHASE 12 — SMOKE TESTS
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    - name: "12 · Smoke-test HTTP"
+      ansible.windows.win_uri:
+        url: "http://localhost:{{ iis_port }}/"
+        return_content: true
+      register: http_check
+      failed_when: "'Ansible over WinRM' not in http_check.content"
+
+    - name: "12 · Smoke-test HTTPS"
+      ansible.windows.win_uri:
+        url: "https://localhost:{{ https_port }}/"
+        return_content: true
+        validate_certs: false
+      register: https_check
+      failed_when: "'Ansible over WinRM' not in https_check.content"
+
+    - name: "12 · Smoke-test dashboard page"
+      ansible.windows.win_uri:
+        url: "http://localhost:{{ iis_port }}/dashboard.html"
+        return_content: true
+      register: dash_check
+      failed_when: "'Server Dashboard' not in dash_check.content"
+
+    - name: "12 · All smoke tests passed!"
+      ansible.builtin.debug:
+        msg: |
+          ✅  HTTP   → http://{{ ansible_ip_addresses | first }}:{{ iis_port }}/
+          ✅  HTTPS  → https://{{ ansible_ip_addresses | first }}:{{ https_port }}/
+          ✅  Dashboard → http://{{ ansible_ip_addresses | first }}:{{ iis_port }}/dashboard.html
+          🔒  SSL cert → {{ cert_dns_name }}
+          📦  Chocolatey → {{ choco_packages | join(', ') }}
+          🛡️  Hardened → disabled {{ disable_services | join(', ') }}
+          ⏰  Scheduled → hourly health check writing JSON reports
