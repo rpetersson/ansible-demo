@@ -1,6 +1,6 @@
 ---
 - name: Demo Playbook for Windows Server (WinRM)
-  hosts: windows
+  hosts: plt nonprod test core platform
   gather_facts: true
   vars:
     app_user: demouser
