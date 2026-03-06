@@ -1,6 +1,6 @@
 ---
 - name: Demo Playbook for Windows Server (WinRM)
-  hosts: plt nonprod test core platform
+  hosts: t-ansible-vm01_45e0
   gather_facts: true
   vars:
     app_user: demouser
